@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ry72xx-flasher"
+version = "0.2.0"
+description = "Application-only HID flasher for the RY7203 bootloader (v1.0.5, v1.0.7) of the Ranked Nova N60"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{name = "patsys"}]
+dependencies = ["hidapi>=0.14,<1", "keystone-engine==0.9.2"]
+
+[project.urls]
+Homepage = "https://github.com/patsys/ry72xx-flasher"
+Issues = "https://github.com/patsys/ry72xx-flasher/issues"
+
+[project.scripts]
+ry72xx-flasher = "ry72xx_flasher.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ry72xx_flasher = ["ry72xx_loader.bin", "ry72xx_loader_v107.bin"]

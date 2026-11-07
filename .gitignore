@@ -1,0 +1,15 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+*.bin
+# The authored, open-source loader images are part of the package.
+!src/ry72xx_flasher/ry72xx_loader.bin
+!src/ry72xx_flasher/ry72xx_loader_v107.bin
+*.pcap
+*.pcapng
+loader.json
+logs/
+.venv-flasher/
+.pytest_cache/
