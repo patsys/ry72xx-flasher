@@ -37,10 +37,24 @@ def shared_open(hid_module):
             pass  # hidapi builds without the switch keep their default
 
 
+HIDAPI_HINT = "install the 'hidapi' package and remove the conflicting 'hid' package (pip uninstall hid; pip install --force-reinstall hidapi)"
+
+
+def import_hidapi():
+    """The PyPI packages 'hid' (ctypes, used by QMK) and 'hidapi' (Cython) both
+    install a module named hid; only the latter provides hid.device."""
+    try:
+        import hid as hid_module
+    except ImportError as error:
+        raise ValueError(f"Cannot load the HID library ({error}); {HIDAPI_HINT}") from None
+    require(hasattr(hid_module, "device"), f"The imported hid module is not hidapi; {HIDAPI_HINT}")
+    return hid_module
+
+
 class HIDTransport:
     def __init__(self, header, enter_stock=False, wait_seconds=30, hid_module=None, resume_holder=False, profile=None):
         if hid_module is None:
-            import hid as hid_module
+            hid_module = import_hidapi()
             shared_open(hid_module)
         self.hid = hid_module
         self.header = header
