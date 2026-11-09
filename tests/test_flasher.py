@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from ry72xx_flasher import image
-from ry72xx_flasher.image import START, END, FLASH_SIZE, digest, parse_hex, xor_words
+from ry72xx_flasher.image import START, APP_END_MAX, FLASH_SIZE, digest, parse_hex, xor_words
 from ry72xx_flasher import profiles
 import dataclasses
 from ry72xx_flasher.session import Session
@@ -23,6 +23,8 @@ from ry72xx_flasher.stubs import hold_stub, release_stub, read_stub, core_stub
 from ry72xx_flasher.cli import main, restored_image, queue_recovery
 from ry72xx_flasher.loader import extract_capture, patch_vendor, load_profile
 from ry72xx_flasher.nvm_audit import audit_nvm_backup
+
+END = profiles.NOVA_N60.app_end
 
 
 def record(address, kind, data=b""):
@@ -46,10 +48,10 @@ def supported(profile):
     return patch("ry72xx_flasher.profiles.PROFILES", (profile,))
 
 
-def valid_metadata(length=0xE908, stored=0x25A4F084):
-    """512-byte info-flash metadata block with a valid application entry and header XOR."""
+def valid_metadata(length=0xE908, stored=0x25A4F084, board_id=0xA104):
+    """512-byte info-flash metadata block with a valid application entry, board ID and header XOR."""
     words = [0] * 128
-    words[7:11] = [1, START, length, stored]
+    words[7:12] = [1, START, length, stored, board_id]
     block = bytearray(b"".join(w.to_bytes(4, "little") for w in words))
     block[0x1FC:0x200] = xor_words(bytes(block[:0x1FC])).to_bytes(4, "little")
     return bytes(block)
@@ -83,10 +85,20 @@ class ImageTests(unittest.TestCase):
         self.reject("\n".join([lines[0], *lines]))
 
     def test_protected_and_outside_addresses(self):
-        for address in [0, START - 1, END, 0x1FFFF]:
+        for address in [0, START - 1, APP_END_MAX, 0x1FFFF]:
             with self.subTest(address=address):
                 self.reject(record(0, 4, (address >> 16).to_bytes(2, "big")) + "\n" + record(address & 65535, 0, b"\0") + "\n" + valid_hex())
         self.reject(record(0, 4, b"\x40\0") + "\n" + record(START, 0, b"\0") + "\n" + record(0, 1))
+
+    def test_overlay_is_bounded_by_the_board(self):
+        self.assertEqual(APP_END_MAX, max(board.app_end for board in profiles.BOARDS))
+        tail = record(END & 65535, 0, b"\0")
+        image = parse_hex(record(0, 4, (END >> 16).to_bytes(2, "big")) + "\n" + tail + "\n" + record(0, 4, b"\0\0") + "\n" + valid_hex())
+        before = bytes(FLASH_SIZE)
+        with supported(fake_profile(before)):
+            with self.assertRaises(ValueError):
+                image.overlay(before, END)
+            self.assertEqual(image.overlay(before, profiles.G65.app_end)[END], 0)
 
     def test_segment_and_linear_extensions(self):
         self.assertEqual(parse_hex(record(0, 4, b"\0\0") + "\n" + valid_hex()).data, parse_hex(valid_hex()).data)
@@ -122,7 +134,7 @@ class NvmAuditTests(unittest.TestCase):
         flash = bytearray([0xFF]) * FLASH_SIZE
         flash[:0x2000] = self.BOOT
         flash[0xF8 * 512:0x100 * 512] = bytes([candidate_fill]) * (8 * 512)
-        metadata = bytes([0xFF]) * 512
+        metadata = bytes([0xFF]) * 0x2C + (0xA104).to_bytes(4, "little") + bytes([0xFF]) * 0x1D0
         (folder / "before_flash.bin").write_bytes(flash)
         (folder / "before_metadata.bin").write_bytes(metadata)
         (folder / "result.json").write_text(json.dumps({
@@ -146,6 +158,20 @@ class NvmAuditTests(unittest.TestCase):
             self.assertEqual(result["candidate_bytes"], 4 * 1024)
             self.assertTrue(result["candidate_permission_bits_enabled"])
 
+    def test_g65_settings_pages_come_from_the_board(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            self.make_backup(folder)
+            metadata = bytearray((folder / "before_metadata.bin").read_bytes())
+            metadata[0x2C:0x30] = (0xA102).to_bytes(4, "little")
+            (folder / "before_metadata.bin").write_bytes(metadata)
+            manifest = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+            manifest["before_metadata_sha256"] = digest(bytes(metadata))
+            (folder / "result.json").write_text(json.dumps(manifest), encoding="utf-8")
+            result = audit_nvm_backup(folder)
+            self.assertEqual((result["board"], result["stock_settings_pages"], result["preserved_vendor_pages"]),
+                             ("Ranked G65", "0xD0-0xEC", "0xED-0xF7"))
+
     def test_nonblank_candidate_is_reported_as_not_erased(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -164,10 +190,11 @@ class NvmAuditTests(unittest.TestCase):
 
 
 class FakeTransport:
-    def __init__(self, fail_page=None, corrupt=None, bad_metadata=False, bad_boot=False):
+    def __init__(self, fail_page=None, corrupt=None, bad_metadata=False, bad_boot=False, metadata=None, pages=117):
         self.flash = bytearray((i * 19 + 7) & 255 for i in range(FLASH_SIZE))
         self.original = bytes(self.flash)
-        self.metadata = valid_metadata()
+        self.metadata = metadata or valid_metadata()
+        self.pages = pages
         self.profile = fake_profile(self.original)
         self.events = []
         self.fail_page = fail_page
@@ -186,11 +213,11 @@ class FakeTransport:
 
     def read(self, address, length, metadata=False):
         if metadata:
-            return bytes([self.metadata[0] ^ 1]) + self.metadata[1:] if self.bad_metadata and self.written == 117 else self.metadata
+            return bytes([self.metadata[0] ^ 1]) + self.metadata[1:] if self.bad_metadata and self.written == self.pages else self.metadata
         if self.bad_boot and address == 0 and length == START:
             return bytes(START)
         result = bytes(self.flash[address:address + length])
-        if self.written == 117 and self.corrupt is not None and address <= self.corrupt < address + length:
+        if self.written == self.pages and self.corrupt is not None and address <= self.corrupt < address + length:
             offset = self.corrupt - address
             result = result[:offset] + bytes([result[offset] ^ 1]) + result[offset + 1:]
         return result
@@ -240,6 +267,36 @@ class SessionTests(unittest.TestCase):
             self.assertEqual((output / "after_flash.bin").read_bytes(), bytes(transport.flash))
             self.assertTrue(result["hidden_metadata_unchanged"] and result["outside_application_unchanged"])
             self.assertLess(transport.events.index("release"), transport.events.index("application"))
+
+    def test_g65_writes_its_longer_application_with_its_loader(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            g65 = profiles.G65
+            transport = FakeTransport(metadata=valid_metadata(length=0x10EBC, stored=0x6EBDC193, board_id=0xA102), pages=136)
+            transport.board = g65
+            seen = []
+            with supported(transport.profile):
+                result = Session(transport, lambda profile, board: seen.append(board) or b"y" * 440,
+                                 Path(temporary) / "s", notify=lambda _: None).run(parse_hex(valid_hex()))
+            self.assertEqual((seen, result["board"], transport.written), ([g65], "Ranked G65", 136))
+            self.assertTrue(result["passed"] and result["outside_application_unchanged"])
+            self.assertEqual(bytes(transport.flash[g65.app_end:]), transport.original[g65.app_end:])
+            self.assertEqual(result["pages"][-1]["address"], g65.app_end - 512)
+            self.assertEqual(xor_words(bytes(transport.flash[START:START + 0x10EBC])), 0x6EBDC193)
+
+    def test_board_mismatch_or_unknown_board_stops_before_data(self):
+        cases = [(valid_metadata(board_id=0xA102), profiles.NOVA_N60),   # GETV N60, metadata G65
+                 (valid_metadata(board_id=0xA104), profiles.G65),        # GETV G65, metadata N60
+                 (valid_metadata(board_id=0xA103), None),                # unknown board
+                 (valid_metadata(length=0x10EBC), None)]                 # N60 ID, G65 range
+        for metadata, getv_board in cases:
+            with self.subTest(board=getv_board), tempfile.TemporaryDirectory() as temporary:
+                transport = FakeTransport(metadata=metadata)
+                transport.board = getv_board
+                with supported(transport.profile), self.assertRaises(ValueError):
+                    Session(transport, b"x" * 440, Path(temporary) / "s", notify=lambda _: None,
+                            recover=lambda session: None).run(parse_hex(valid_hex()))
+                self.assertNotIn("loader", transport.events)
+                self.assertFalse(any(isinstance(e, tuple) and e[0] == "data" for e in transport.events))
 
     def test_failure_at_first_middle_and_last_page_holds_without_release(self):
         for page in [1, 57, 117]:
@@ -425,7 +482,7 @@ class FakeHID:
         self.handle = handle or FakeHandle()
 
     def enumerate(self, vid, pid):
-        return self.boots if vid == 0x352D else self.apps
+        return self.boots if vid == 0x352D else [d for d in self.apps if d.get("product_id", pid) == pid]
 
     def device(self):
         return self.handle
@@ -433,7 +490,7 @@ class FakeHID:
 
 class TransportTests(unittest.TestCase):
     def transport(self, replies=(), short=False):
-        transport = HIDTransport(bytes(52), hid_module=FakeHID([]), wait_seconds=0, profile=profiles.V105)
+        transport = HIDTransport(bytes(52), hid_module=FakeHID([]), wait_seconds=0, profile=profiles.V105, board=profiles.NOVA_N60)
         transport.handle = FakeHandle(replies, short)
         return transport
 
@@ -447,11 +504,28 @@ class TransportTests(unittest.TestCase):
     def test_resume_holder_uses_read_only_probe_not_getv(self):
         reply = bytes.fromhex("0100007306000177fff706f933e0") + bytes(50)
         handle = FakeHandle([reply])
-        transport = HIDTransport(bytes(52), hid_module=FakeHID([dict(path=b"original")], handle=handle), wait_seconds=0, resume_holder=True, profile=profiles.V105)
+        transport = HIDTransport(bytes(52), hid_module=FakeHID([dict(path=b"original")], handle=handle), wait_seconds=0, resume_holder=True, profile=profiles.V105, board=profiles.NOVA_N60)
         self.assertIn("held-session", transport.open())
         self.assertEqual(transport.path, b"original")
         self.assertEqual(len(handle.writes), 8)
         self.assertFalse(any(report[1:13] == bytes.fromhex("0000000004000001") + b"getv" for report in handle.writes))
+
+    def test_enter_stock_switches_the_matching_stock_board_only(self):
+        for board in profiles.BOARDS:
+            vid, pid = board.app_usb
+            apps = [dict(vendor_id=vid, product_id=pid, usage_page=0x01, path=bytes([i])) for i in range(5)]
+            apps.append(dict(vendor_id=vid, product_id=pid, usage_page=0xFF00, serial_number=board.stock_serial, path=b"vendor"))
+            with self.subTest(board=board.name):
+                handle = FakeHandle()
+                with self.assertRaises(TimeoutError):
+                    HIDTransport(bytes(52), hid_module=FakeHID([], apps, handle), wait_seconds=0, enter_stock=True).open()
+                self.assertEqual([report[:3] for report in handle.writes], [bytes.fromhex("04a501")])
+                self.assertEqual(handle.path, b"vendor")
+            foreign = [dict(d, serial_number="other") if d["usage_page"] == 0xFF00 else d for d in apps]
+            handle = FakeHandle()
+            with self.assertRaises(ValueError):
+                HIDTransport(bytes(52), hid_module=FakeHID([], foreign, handle), wait_seconds=0, enter_stock=True).open()
+            self.assertEqual(handle.writes, [])
 
     def test_supported_version_and_zero_report_id(self):
         reply = bytes.fromhex("0000000010000001") + b"version:" + bytes.fromhex("a1050000a1040000") + bytes(40)
@@ -491,6 +565,11 @@ class TransportTests(unittest.TestCase):
         for sequence, data in [(0, bytes(512)), (118, bytes(512)), (1, bytes(511))]:
             with self.assertRaises(ValueError):
                 self.transport().data(sequence, data)
+        g65 = self.transport([reply.replace(b"\x75", b"\x88", 1)])
+        g65.board = profiles.G65
+        g65.data(136, b"x" * 512)
+        with self.assertRaises(ValueError):
+            g65.data(137, b"x" * 512)
 
     def test_bad_ack_sequence_length_and_status(self):
         for reply in [bytes.fromhex("020200730100017704") + bytes(55), bytes.fromhex("02010073020001770400") + bytes(54), bytes.fromhex("020100730100017702") + bytes(55)]:
@@ -554,7 +633,7 @@ class StubAndCLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             before = bytes((i * 19 + 7) & 255 for i in range(FLASH_SIZE))
-            metadata = bytes(512)
+            metadata = valid_metadata()
             manifest = dict(format=1, boot_verified=True, before_flash_sha256=digest(before), before_metadata_sha256=digest(metadata))
             (folder / "before_flash.bin").write_bytes(before)
             (folder / "before_metadata.bin").write_bytes(metadata)
@@ -571,6 +650,19 @@ class StubAndCLITests(unittest.TestCase):
                 (folder / "before_flash.bin").write_bytes(before[:-1] + bytes([before[-1] ^ 1]))
                 with self.assertRaises(ValueError):
                     restored_image(folder)
+
+    def test_restore_range_follows_the_backed_up_board(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            before = bytes((i * 19 + 7) & 255 for i in range(FLASH_SIZE))
+            metadata = valid_metadata(length=0x10EBC, board_id=0xA102)
+            manifest = dict(format=1, boot_verified=True, before_flash_sha256=digest(before), before_metadata_sha256=digest(metadata))
+            (folder / "before_flash.bin").write_bytes(before)
+            (folder / "before_metadata.bin").write_bytes(metadata)
+            (folder / "result.json").write_text(json.dumps(manifest))
+            with supported(fake_profile(before)):
+                restored = restored_image(folder)
+            self.assertEqual((min(restored.data), max(restored.data)), (START, profiles.G65.app_end - 1))
 
 
 class LoaderTests(unittest.TestCase):
@@ -618,12 +710,21 @@ V107_DUMP = Path(__file__).resolve().parents[3] / "flash_controller_research" / 
 
 class BootRevisionTests(unittest.TestCase):
     def test_getv_selects_profile_and_rejects_others(self):
-        for version, profile in [("a1050000a1040000", profiles.V105), ("a1070000a1040000", profiles.V107)]:
+        for version, profile, board in [("a1050000a1040000", profiles.V105, profiles.NOVA_N60),
+                                        ("a1070000a1040000", profiles.V107, profiles.NOVA_N60),
+                                        ("a1070000a1020000", profiles.V107, profiles.G65)]:
             reply = bytes.fromhex("0000000010000001") + b"version:" + bytes.fromhex(version) + bytes(40)
             transport = HIDTransport(bytes(52), hid_module=FakeHID([]), wait_seconds=0)
             transport.handle = FakeHandle([reply])
             self.assertEqual(transport.get_version(), version)
             self.assertIs(transport.profile, profile)
+            self.assertIs(transport.board, board)
+        for version in ["a1070000a1030000", "a1060000a1020000"]:
+            reply = bytes.fromhex("0000000010000001") + b"version:" + bytes.fromhex(version) + bytes(40)
+            transport = HIDTransport(bytes(52), hid_module=FakeHID([]), wait_seconds=0)
+            transport.handle = FakeHandle([reply])
+            with self.assertRaises(ValueError):
+                transport.get_version()
         reply = bytes.fromhex("0000000010000001") + b"version:" + bytes.fromhex("a1070000a1040000") + bytes(40)
         transport = HIDTransport(bytes(52), hid_module=FakeHID([]), wait_seconds=0, profile=profiles.V105)
         transport.handle = FakeHandle([reply])
@@ -634,30 +735,35 @@ class BootRevisionTests(unittest.TestCase):
         from ry72xx_flasher.cli import select_loader
         header, loader = select_loader("authored", None)
         self.assertEqual(len(header), 52)
-        self.assertNotEqual(loader(profiles.V105), loader(profiles.V107))
-        self.assertEqual(digest(loader(profiles.V107)), "66c95355137e042e808d5a0e8e325894365b3d869b54fd372b0b10f1b67cb58a")
+        n60, g65 = profiles.NOVA_N60, profiles.G65
+        self.assertNotEqual(loader(profiles.V105, n60), loader(profiles.V107, n60))
+        self.assertEqual(digest(loader(profiles.V107, n60)), "66c95355137e042e808d5a0e8e325894365b3d869b54fd372b0b10f1b67cb58a")
+        self.assertEqual(digest(loader(profiles.V107, g65)), "78bf2bcf6a74fc6054493b412871c1e8d70e88011762d7edf06cb9b7c45521a2")
+        with self.assertRaises(ValueError):
+            loader(profiles.V105, g65)
         with patch("ry72xx_flasher.cli.load_profile", return_value=(bytes(52), b"c" * 440)):
             header, loader = select_loader("profile", Path("unused"))
-        self.assertEqual(loader(profiles.V105), b"c" * 440)
-        with self.assertRaises(ValueError):
-            loader(profiles.V107)
+        self.assertEqual(loader(profiles.V105, n60), b"c" * 440)
+        for profile, board in [(profiles.V107, n60), (profiles.V105, g65)]:
+            with self.assertRaises(ValueError):
+                loader(profile, board)
 
     @unittest.skipUnless((V107_DUMP / "flash_pass1.bin").exists(), "v1.0.7 dump not present")
     def test_checksum_word_on_real_v107_dump(self):
         from ry72xx_flasher.image import with_boot_checksum, CHECKSUM_WORD
         flash = (V107_DUMP / "flash_pass1.bin").read_bytes()
         metadata = (V107_DUMP / "info_pass1.bin").read_bytes()[0x600:0x800]
-        result, old, new = with_boot_checksum(flash, metadata)
+        result, old, new = with_boot_checksum(flash, metadata, END)
         self.assertEqual((result, old), (flash, new), "the stock application already passes: no change")
         image = parse_hex(valid_hex())
-        corrected, old, new = with_boot_checksum(image.overlay(flash), metadata)
+        corrected, old, new = with_boot_checksum(image.overlay(flash, END), metadata, END)
         self.assertEqual(xor_words(corrected[START:START + 0xE908]), 0x25A4F084)
-        changed = [i for i in range(FLASH_SIZE) if corrected[i] != image.overlay(flash)[i]]
+        changed = [i for i in range(FLASH_SIZE) if corrected[i] != image.overlay(flash, END)[i]]
         self.assertTrue(all(CHECKSUM_WORD <= i < CHECKSUM_WORD + 4 for i in changed))
         broken = bytearray(metadata)
         broken[0x24] ^= 4
         with self.assertRaises(ValueError):
-            with_boot_checksum(flash, bytes(broken))
+            with_boot_checksum(flash, bytes(broken), END)
 
     def test_session_on_v107_profile_writes_checksummed_image(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -665,9 +771,9 @@ class BootRevisionTests(unittest.TestCase):
             transport.profile = dataclasses.replace(profiles.V107, boot_sha=digest(transport.original[:START]))
             seen = []
             with supported(transport.profile):
-                result = Session(transport, lambda profile: seen.append(profile) or b"y" * 440,
+                result = Session(transport, lambda profile, board: seen.append((profile, board)) or b"y" * 440,
                                  Path(temporary) / "s", notify=lambda _: None).run(parse_hex(valid_hex()))
-            self.assertEqual(seen, [transport.profile])
+            self.assertEqual(seen, [(transport.profile, profiles.NOVA_N60)])
             self.assertEqual(result["boot_profile"], "v1.0.7")
             self.assertEqual(xor_words(bytes(transport.flash[START:START + 0xE908])), 0x25A4F084)
             self.assertIn("boot_checksum_word", result)

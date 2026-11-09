@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ry72xx-flasher"
 version = "0.2.0"
-description = "Application-only HID flasher for the RY7203 bootloader (v1.0.5, v1.0.7) of the Ranked Nova N60"
+description = "Application-only HID flasher for the RY7203 bootloader (v1.0.5, v1.0.7) of the Ranked Nova N60 and G65"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
@@ -24,4 +24,4 @@ ry72xx-flasher = "ry72xx_flasher.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ry72xx_flasher = ["ry72xx_loader.bin", "ry72xx_loader_v107.bin"]
+ry72xx_flasher = ["ry72xx_loader.bin", "ry72xx_loader_v107.bin", "ry72xx_loader_v107_g65.bin"]

@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 import time
 
-from .image import Image, START, END, FLASH_SIZE, digest, require, with_boot_checksum
-from .profiles import by_boot_sha
+from .image import Image, START, FLASH_SIZE, PAGE_SIZE, application_end, digest, require, with_boot_checksum
+from .profiles import board_by_metadata, by_boot_sha
 from . import __version__
 
 
@@ -23,7 +23,7 @@ def durable_write(path, data):
 
 class Session:
     def __init__(self, transport, loader, output, notify=print, recover=None, retain_error_handle=False):
-        """loader: the 440-byte RAM loader, or a function of the bootloader profile returning it."""
+        """loader: the 440-byte RAM loader, or a function of the bootloader profile and board returning it."""
         self.transport = transport
         self.loader = loader
         self.output = Path(output)
@@ -85,8 +85,6 @@ class Session:
             boot = self.transport.read(0, START)
             profile = self.transport.profile
             require(len(boot) == START and profile is not None and digest(boot) == profile.boot_sha, "Unsupported bootloader; no DATA sent")
-            loader = self.loader(profile) if callable(self.loader) else self.loader
-            require(len(loader) == 440, "RAM loader must be 440 bytes")
             self.log["boot_profile"] = profile.name
             self.log["boot_verified"] = True
             self.save()
@@ -94,14 +92,22 @@ class Session:
             metadata = self.transport.read(0x10000600, 512, metadata=True)
             require(len(metadata) == 512, "Short hidden metadata backup")
             durable_write(self.output / "before_metadata.bin", metadata)
+            # The board comes from the metadata just backed up; GETV reported the same ID.
+            board = board_by_metadata(metadata)
+            require(getattr(self.transport, "board", None) in (None, board), "GETV board differs from the metadata board")
+            end = board.app_end
+            require(application_end(metadata) == end, "Metadata application range does not match the board")
+            self.log["board"] = board.name
+            loader = self.loader(profile, board) if callable(self.loader) else self.loader
+            require(len(loader) == 440, "RAM loader must be 440 bytes")
             self.log["probe_only"] = image is None
-            expected = before if image is None else image.overlay(before)
+            expected = before if image is None else image.overlay(before, end)
             if image is not None and image.boot_checksum:
-                expected, old_word, new_word = with_boot_checksum(expected, metadata)
+                expected, old_word, new_word = with_boot_checksum(expected, metadata, end)
                 self.log["boot_checksum_word"] = dict(address=hex(START + 0x1C), image=hex(old_word), written=hex(new_word))
             durable_write(self.output / "expected_flash.bin", expected)
             self.log.update(before_flash_sha256=digest(before), before_metadata_sha256=digest(metadata),
-                            expected_flash_sha256=digest(expected), target_application_sha256=digest(expected[START:END]),
+                            expected_flash_sha256=digest(expected), target_application_sha256=digest(expected[START:end]),
                             loader_sha256=digest(loader))
             self.save()
             # Read persisted backup files back before the first possible erase.
@@ -111,15 +117,17 @@ class Session:
             if image is not None:
                 self.log["core_before_data"] = self.transport.core(True)
                 self.transport.begin_programming(loader)
-                for index in range(117):
+                # The loader ends the native DATA state at the board's last page.
+                count = (end - START) // PAGE_SIZE
+                for index in range(count):
                     page = expected[START + index * 512:START + (index + 1) * 512]
                     self.log["write_started"] = True
                     self.save()
                     self.transport.data(index + 1, page)
                     self.log["pages"].append(dict(sequence=index + 1, address=START + index * 512, sha256=digest(page)))
                     self.save()
-                    if index == 0 or (index + 1) % 16 == 0 or index == 116:
-                        self.notify(f"Programmed {index + 1}/117 application pages")
+                    if index == 0 or (index + 1) % 16 == 0 or index == count - 1:
+                        self.notify(f"Programmed {index + 1}/{count} application pages")
             self.log["core_before_readback"] = self.transport.core(False)
             after = self.snapshot("after_flash.bin")
             after_metadata = self.transport.read(0x10000600, 512, metadata=True)
@@ -127,7 +135,7 @@ class Session:
             self.log["core_after_readback"] = self.transport.core(False)
             self.log.update(whole_flash_matches_expected=after == expected,
                             bootloader_unchanged=after[:START] == before[:START],
-                            outside_application_unchanged=after[:START] + after[END:] == before[:START] + before[END:],
+                            outside_application_unchanged=after[:START] + after[end:] == before[:START] + before[end:],
                             hidden_metadata_unchanged=after_metadata == metadata,
                             after_flash_sha256=digest(after), after_metadata_sha256=digest(after_metadata))
             self.save()
@@ -170,6 +178,7 @@ class Session:
                         metadata = (session.output / "before_metadata.bin").read_bytes()
                         require(len(before) == FLASH_SIZE and digest(before) == session.log["before_flash_sha256"], "Recovery backup changed")
                         require(by_boot_sha(digest(before[:START])) is session.transport.profile and len(metadata) == 512 and digest(metadata) == session.log["before_metadata_sha256"], "Recovery identity/metadata backup changed")
+                        end = board_by_metadata(metadata).app_end
                     except (ValueError, OSError, KeyError) as error:
                         session.log["recovery_request_error"] = str(error)
                         session.save_best_effort()
@@ -184,7 +193,7 @@ class Session:
                         restoration = Session(session.transport, session.loader, output, notify=session.notify,
                                               recover=lambda failed: failed.transport.hold_once(), retain_error_handle=True)
                         try:
-                            restoration.run(Image(dict(enumerate(before[START:END], START)), boot_checksum=False), reuse_open=True)
+                            restoration.run(Image(dict(enumerate(before[START:end], START)), boot_checksum=False), reuse_open=True)
                         except Exception as error:
                             session.log["recovery_restore_error"] = str(error)
                             session.log["recovery_restore_result"] = str(output / "result.json")

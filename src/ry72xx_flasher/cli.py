@@ -8,9 +8,9 @@ from pathlib import Path
 import sys
 
 from . import __version__
-from .image import Image, START, END, FLASH_SIZE, digest, parse_hex, require
+from .image import Image, START, FLASH_SIZE, digest, parse_hex, require
 from .loader import authored, load_profile, setup
-from .profiles import V105, by_boot_sha
+from .profiles import NOVA_N60, V105, board_by_metadata, by_boot_sha
 
 
 def restored_image(folder):
@@ -22,21 +22,22 @@ def restored_image(folder):
     require(len(before) == FLASH_SIZE and digest(before) == manifest.get("before_flash_sha256"), "Backup flash digest mismatch")
     require(len(metadata) == 512 and digest(metadata) == manifest.get("before_metadata_sha256"), "Backup metadata digest mismatch")
     by_boot_sha(digest(before[:START]))
-    # Only application pages are restored. Device-specific protected data are
-    # checked and preserved from the CURRENT same-session backup, never copied.
-    return Image(dict(enumerate(before[START:END], START)), boot_checksum=False)
+    # Only the backed-up board's application pages are restored. Device-specific
+    # protected data are checked and preserved from the CURRENT same-session backup, never copied.
+    end = board_by_metadata(metadata).app_end
+    return Image(dict(enumerate(before[START:end], START)), boot_checksum=False)
 
 
 def select_loader(kind, config):
-    """START header and a function bootloader profile -> 440-byte RAM loader."""
+    """START header and a function (bootloader profile, board) -> 440-byte RAM loader."""
     if kind == "authored":
-        # One plaintext START header for every revision; the loader image is per revision.
-        return authored()[0], lambda profile: authored(profile)[1]
+        # One plaintext START header for every revision; the loader image is per revision and board.
+        return authored()[0], lambda profile, board: authored(profile, board)[1]
     header, captured = load_profile(config)
 
-    def loader(profile):
-        # The capture-derived patch encodes v1.0.5 dispatcher returns.
-        require(profile is V105, "Capture-derived loader profiles support bootloader v1.0.5 only")
+    def loader(profile, board):
+        # The capture-derived patch encodes v1.0.5 dispatcher returns and the Nova N60 page bound.
+        require(profile is V105 and board is NOVA_N60, "Capture-derived loader profiles support the Nova N60 on bootloader v1.0.5 only")
         return captured
     return header, loader
 
@@ -52,7 +53,7 @@ def queue_recovery(folder):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Bounded application-only Nova RY7203 flasher; no bootloader/settings programming")
+    parser = argparse.ArgumentParser(description="Bounded application-only RY7203 flasher (Ranked Nova N60, G65); no bootloader/settings programming")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--mcu", choices=["RY7203"], default="RY7203")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -102,15 +103,16 @@ def main(argv=None):
             print(json.dumps(dict(passed=True, bytes=len(image.data), lowest_address=hex(min(image.data)), highest_address=hex(max(image.data)), hardware_access=False)))
             return 0
         header, loader = select_loader(args.loader, args.config)
-        held = None
+        held = held_board = None
         if args.resume_holder:
             held = by_boot_sha(digest((Path(args.restore) / "before_flash.bin").read_bytes()[:START]))
+            held_board = board_by_metadata((Path(args.restore) / "before_metadata.bin").read_bytes())
         # Import HID only after complete image/profile validation.
         from .transport import HIDTransport
         from .session import Session
         output = args.output or Path.home() / ".local/state/ry72xx-flasher" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         print(f"{'Read-only probe' if args.probe else 'Application-only flash'} requested. Backups/results: {output}", flush=True)
-        transport = HIDTransport(header, enter_stock=args.enter_stock, wait_seconds=args.wait, resume_holder=args.resume_holder, profile=held)
+        transport = HIDTransport(header, enter_stock=args.enter_stock, wait_seconds=args.wait, resume_holder=args.resume_holder, profile=held, board=held_board)
         result = Session(transport, loader, output, notify=lambda message: print(message, flush=True)).run(image)
         print(json.dumps(dict(passed=result["passed"], verified=result["verified"], result_file=str(output / "result.json"))), flush=True)
         return 0

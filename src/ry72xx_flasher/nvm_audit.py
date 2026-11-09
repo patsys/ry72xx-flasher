@@ -5,11 +5,9 @@ import json
 from pathlib import Path
 
 from .image import FLASH_SIZE, digest, require
-from .profiles import by_boot_sha
+from .profiles import board_by_metadata, by_boot_sha
 
 PAGE_SIZE = 512
-STOCK_CONFIG_FIRST_PAGE = 0xD5
-STOCK_CONFIG_LAST_PAGE = 0xDF
 QMK_CANDIDATE_FIRST_PAGE = 0xF8
 QMK_CANDIDATE_LAST_PAGE = 0xFF
 
@@ -30,12 +28,14 @@ def audit_nvm_backup(folder):
     by_boot_sha(digest(flash[:0x2000]))
     require(len(metadata) == 512 and digest(metadata) == manifest.get("before_metadata_sha256"),
             "Hidden metadata backup size or digest mismatch")
+    board = board_by_metadata(metadata)
+    stock_first, stock_last = board.settings_pages
 
     candidate_start = QMK_CANDIDATE_FIRST_PAGE * PAGE_SIZE
     candidate_end = (QMK_CANDIDATE_LAST_PAGE + 1) * PAGE_SIZE
     candidate = flash[candidate_start:candidate_end]
-    stock_start = STOCK_CONFIG_FIRST_PAGE * PAGE_SIZE
-    stock_end = (STOCK_CONFIG_LAST_PAGE + 1) * PAGE_SIZE
+    stock_start = stock_first * PAGE_SIZE
+    stock_end = (stock_last + 1) * PAGE_SIZE
     stock = flash[stock_start:stock_end]
     permission_words = [int.from_bytes(metadata[0x50 + group * 4:0x54 + group * 4], "little") for group in range(8)]
     candidate_permissions = {
@@ -44,6 +44,7 @@ def audit_nvm_backup(folder):
     }
     return {
         "read_only_backup_verified": True,
+        "board": board.name,
         "candidate_pages": f"0x{QMK_CANDIDATE_FIRST_PAGE:02X}-0x{QMK_CANDIDATE_LAST_PAGE:02X}",
         "candidate_address_range": f"0x{candidate_start:05X}..0x{candidate_end - 1:05X}",
         "candidate_bytes": len(candidate),
@@ -51,9 +52,9 @@ def audit_nvm_backup(folder):
         "candidate_erased": all(byte == 0xFF for byte in candidate),
         "candidate_permission_bits_enabled": all(candidate_permissions.values()),
         "candidate_permission_pages_disabled": [f"0x{page:02X}" for page, enabled in candidate_permissions.items() if not enabled],
-        "preserved_vendor_pages": "0xE0-0xF7",
-        "preserved_vendor_region_sha256": digest(flash[0xE0 * PAGE_SIZE:0xF8 * PAGE_SIZE]),
-        "stock_settings_pages": f"0x{STOCK_CONFIG_FIRST_PAGE:02X}-0x{STOCK_CONFIG_LAST_PAGE:02X}",
+        "preserved_vendor_pages": f"0x{stock_last + 1:02X}-0x{QMK_CANDIDATE_FIRST_PAGE - 1:02X}",
+        "preserved_vendor_region_sha256": digest(flash[stock_end:candidate_start]),
+        "stock_settings_pages": f"0x{stock_first:02X}-0x{stock_last:02X}",
         "stock_settings_sha256": digest(stock),
         "stock_settings_erased": all(byte == 0xFF for byte in stock),
         "flash_sha256": digest(flash),

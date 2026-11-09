@@ -20,15 +20,25 @@ from pathlib import Path
 import struct
 
 from .image import digest, require
-from .profiles import V105
+from .profiles import G65, NOVA_N60, V105, V107
 
-# Packaged loader image per bootloader revision (loader/build_loader.py); differ only in HOLD_RETURN.
+# Packaged loader image per bootloader revision and board (loader/build_loader.py);
+# they differ only in HOLD_RETURN (revision) and LAST_PAGE (board).
 AUTHORED_SHA = {
     "ry72xx_loader.bin": "22487f077007401c86c417094cc4aa2599b8afcb2fdb5f20730eb94e28ee9741",
     "ry72xx_loader_v107.bin": "66c95355137e042e808d5a0e8e325894365b3d869b54fd372b0b10f1b67cb58a",
+    "ry72xx_loader_v107_g65.bin": "78bf2bcf6a74fc6054493b412871c1e8d70e88011762d7edf06cb9b7c45521a2",
+}
+AUTHORED_RESOURCE = {
+    (V105.name, NOVA_N60.name): "ry72xx_loader.bin",
+    (V107.name, NOVA_N60.name): "ry72xx_loader_v107.bin",
+    (V107.name, G65.name): "ry72xx_loader_v107_g65.bin",
 }
 CLEAR_LENGTH = 0x1CC00          # 0x7300 * 4; checked against header bytes 2..3
-BOOT_REVISION = 0xA104          # second GETV word, a1040000 in v1.0.5 and v1.0.7
+# Captured Nova N60 value. The bootloader reads the board ID (metadata +0x2C)
+# only for the GETV reply, so this header serves the G65 (board ID 0xA102) too;
+# a G65 accepted it for read-only START stubs.
+BOOT_REVISION = 0xA104
 AUTHORED_HEADER = (
     bytes.fromhex("01000073e8010177")                      # START, payload 0x1e8
     + struct.pack("<II", CLEAR_LENGTH, BOOT_REVISION)       # plain header fields
@@ -122,10 +132,12 @@ def setup(capture, destination):
     destination.chmod(0o600)
 
 
-def authored(profile=V105):
-    """Return the authored (header, loader) pair for a bootloader revision after checking the packaged hash."""
-    loader = resources.files(__package__).joinpath(profile.loader_resource).read_bytes()
-    require(len(loader) == 440 and digest(loader) == AUTHORED_SHA[profile.loader_resource], "Packaged authored loader changed; rebuild and re-validate")
+def authored(profile=V105, board=NOVA_N60):
+    """Return the authored (header, loader) pair for a bootloader revision and board after checking the packaged hash."""
+    resource = AUTHORED_RESOURCE.get((profile.name, board.name))
+    require(resource is not None, f"No authored loader for {board.name} on bootloader {profile.name}")
+    loader = resources.files(__package__).joinpath(resource).read_bytes()
+    require(len(loader) == 440 and digest(loader) == AUTHORED_SHA[resource], "Packaged authored loader changed; rebuild and re-validate")
     require(len(AUTHORED_HEADER) == 52, "Authored START header must be 52 bytes")
     return AUTHORED_HEADER, loader
 

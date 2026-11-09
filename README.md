@@ -1,26 +1,43 @@
 # ry72xx-flasher
 
-Experimental Python 3 host tool for the **observed Ranked Nova N60 ISO RY7203
-bootloader revisions**, not a generic programmer for every RY72xx part.
+Experimental Python 3 host tool for the **observed RY7203 bootloader revisions
+of the Ranked Nova N60 ISO and the Ranked G65**, not a generic programmer for
+every RY72xx part.
 
 ## Supported bootloader revisions
 
-A board is accepted only when its GETV reply and the SHA-256 of its whole boot
-region (`0x0000..0x1fff`) name the same entry in `profiles.py`; any other
-revision is refused before a RAM stub or DATA packet is sent.
+A bootloader is accepted only when the first GETV word and the SHA-256 of its
+whole boot region (`0x0000..0x1fff`) name the same entry in `profiles.py`; any
+other revision is refused before a RAM stub or DATA packet is sent.
 
-| Revision | GETV | Boot SHA-256 | Status |
+| Revision | GETV (first word) | Boot SHA-256 | Status |
 |---|---|---|---|
-| `ry72xx_boot_usb_v1.0.5` | `a1050000a1040000` | `e46c6d93…` | read, probe and application flashing validated on hardware |
-| `ry72xx_boot_usb_v1.0.7` | `a1070000a1040000` | `eae819e4…` | read path, core check and scratch-page flash diagnostics validated on hardware; release/flash validated in emulation only |
+| `ry72xx_boot_usb_v1.0.5` | `a1050000` | `e46c6d93…` | read, probe and application flashing validated on hardware |
+| `ry72xx_boot_usb_v1.0.7` | `a1070000` | `eae819e4…` | read path, core check and scratch-page flash diagnostics validated on hardware; release/flash validated in emulation only |
+
+## Supported boards
+
+The second GETV word is the board ID, which the bootloader reads from the
+info-flash metadata (`0x1000062c`). The flasher selects the board from it and
+requires the metadata it backs up to name the same board and an application
+range that matches it.
+
+| Board | Board ID | Stock application USB | Application pages | Stock settings pages | Status |
+|---|---|---|---|---|---|
+| Ranked Nova N60 | `a104` | `3532:a0a3` | `0x2000..0x109ff` (117) | `0xd5..0xdf` | see bootloader table |
+| Ranked G65 (Guardian 65%) | `a102` | `3532:a0c2` | `0x2000..0x12fff` (136) | `0xd0..0xec` | v1.0.7 only; read path validated on hardware (two matching full backups); flashing and release validated in emulation only |
+
+The G65 uses the same v1.0.7 bootloader bytes as the Nova N60; its stock
+application is longer (metadata length `0x10ebc`).
 
 The revisions share the START framing, loader entry ABI and the packet
 dispatcher (relocated by `+0x24`, same stack frame). They differ in the START
 handler frame (`+8` bytes), the native return addresses the stubs verify, and
 the USB bootstrap re-entry; the per-revision values are documented in
-`profiles.py`. The authored loader is built once per revision
-(`ry72xx_loader.bin`, `ry72xx_loader_v107.bin`), differing only in that
-re-entry address. Capture-derived loader profiles remain v1.0.5 only.
+`profiles.py`. The authored loader is built once per revision and board
+(`ry72xx_loader.bin`, `ry72xx_loader_v107.bin`, `ry72xx_loader_v107_g65.bin`),
+differing only in that re-entry address and the board's last application page.
+Capture-derived loader profiles remain Nova N60 on v1.0.5 only.
 
 **Application checksum.** Before starting the application the bootloader can
 verify the XOR of all 32-bit words of `0x2000 + length` against the info-flash
@@ -31,8 +48,8 @@ image the flasher therefore sets the reserved Cortex-M0 vector entry 7
 value read from the board's own metadata. The metadata is never written.
 Restoring a backup writes it byte-exact, without this adjustment.
 
-It writes only CPU application addresses `0x2000..0x109ff` (117 pages of 512
-bytes). Bootloader, settings/calibration and hidden metadata are excluded by
+It writes only the board's CPU application pages (Nova N60 `0x2000..0x109ff`,
+117 pages of 512 bytes; G65 `0x2000..0x12fff`, 136 pages). Bootloader, settings/calibration and hidden metadata are excluded by
 both host checks and a bounded RAM loader. It backs up the full 128 KiB CPU flash
 and the separate 512-byte metadata window, persists and checks those files
 before programming, then compares the entire flash and metadata before release.
@@ -99,7 +116,8 @@ Binary files without address metadata are intentionally unsupported.
 Enter the preserved bootloader before flashing. On the tested QMK port, hold
 Esc while reconnecting. With the original stock application, `--enter-stock`
 allows the previously observed stock mode-switch command; it requires exactly
-the original six-interface Nova application and does not send that command to
+one original six-interface stock application of a supported board (vendor
+collection with the stock serial number) and does not send that command to
 QMK firmware. Multiple matching boards are rejected.
 
 ```sh

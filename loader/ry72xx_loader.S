@@ -1,12 +1,13 @@
 @ Copyright 2026 patsys
 @ SPDX-License-Identifier: GPL-3.0-or-later
 @
-@ Authored RAM programming loader for the Nova RY7203 bootloader
-@ (ry72xx_boot_usb_v1.0.5, GETV a1050000a1040000, and v1.0.7, GETV
-@ a1070000a1040000). The two revisions share the entry ABI, the packet
-@ dispatcher (relocated by +0x24, same frame) and the native context; only the
-@ USB bootstrap re-entry differs, so HOLD_RETURN is set per image at assembly
-@ time (build_loader.py): v1.0.5 0x849, v1.0.7 0x86B.
+@ Authored RAM programming loader for the RY7203 bootloader
+@ (ry72xx_boot_usb_v1.0.5, GETV a1050000, and v1.0.7, GETV a1070000). The two
+@ revisions share the entry ABI, the packet dispatcher (relocated by +0x24, same
+@ frame) and the native context; only the USB bootstrap re-entry differs, so
+@ HOLD_RETURN is set per image at assembly time (build_loader.py): v1.0.5 0x849,
+@ v1.0.7 0x86B. LAST_PAGE is the board's last application page: Nova N60 132
+@ (CPU 0x109FF), G65 151 (CPU 0x12FFF).
 @
 @ The bootloader copies this 440-byte image to 0x20000000 after a START frame
 @ and calls fixed entry points in it:
@@ -19,9 +20,10 @@
 @   0x13A  initialise                       r0 = core clock in Hz
 @
 @ Return value 0 is acknowledged by the bootloader (ACK 4); anything else is a
-@ NACK. Every page operation is admitted only for application pages 16..132
-@ (CPU 0x2000..0x109FF), the native packet context 0x20000324 with a 512-byte
-@ payload, and, for programming, the payload buffer 0x2000032C. Bootloader,
+@ NACK. Every page operation is admitted only for application pages
+@ 16..LAST_PAGE (CPU 0x2000..LAST_PAGE * 512 + 0x1FF), the native packet
+@ context 0x20000324 with a 512-byte payload, and, for programming, the
+@ payload buffer 0x2000032C. Bootloader,
 @ settings, wear-leveling and hidden metadata pages are never touched.
 @
 @ Two stack writes keep the native session usable for the host's in-session
@@ -53,7 +55,9 @@
     .equ PACKET_PAYLOAD,    0x2000032C
     .equ PLAINTEXT_FLAG,    0x20000214
     .equ FIRST_PAGE,        16
+    .ifndef LAST_PAGE
     .equ LAST_PAGE,         132
+    .endif
     .ifndef HOLD_RETURN
     .equ HOLD_RETURN,       0x849
     .endif

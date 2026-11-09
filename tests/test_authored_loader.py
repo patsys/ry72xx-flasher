@@ -30,6 +30,7 @@ ERASE, PROGRAM, META_ERASE, META_PROGRAM, INIT = 0x24, 0x6C, 0xDA, 0xFC, 0x13A
 class AuthoredLoader(unittest.TestCase):
     loader = LOADER
     hold_return = 0x849
+    last_page = 132
 
     def call(self, entry, r0=0, r1=PAYLOAD, r4=CTX, length=512, primask=1, flash_fill=0x00, measured=False):
         u = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -104,7 +105,7 @@ class AuthoredLoader(unittest.TestCase):
         self.assertEqual(len(self.loader.read_bytes()), 440)
 
     def test_erase_admitted_page(self):
-        for page in (16, 80, 132):
+        for page in (16, 80, self.last_page):
             u, status, writes = self.call(ERASE, page)
             self.assertEqual(status, 0)
             self.assertIn((0x04, page << 7), writes)
@@ -138,15 +139,15 @@ class AuthoredLoader(unittest.TestCase):
         self.assertEqual(bytes(u.mem_read(80 * 512, 512)), b"\xff" * 512)
 
     def test_last_page_clears_data_active(self):
-        u, status, _ = self.call(PROGRAM, 132, flash_fill=0xFF)
+        u, status, _ = self.call(PROGRAM, self.last_page, flash_fill=0xFF)
         self.assertEqual(status, 0)
         self.assertEqual(self.stack_word(u, 8), 0)
 
     def test_rejections_touch_no_controller(self):
         cases = [
-            (ERASE, dict(r0=15)), (ERASE, dict(r0=133)), (ERASE, dict(r0=0xFA)), (ERASE, dict(r0=0)),
+            (ERASE, dict(r0=15)), (ERASE, dict(r0=self.last_page + 1)), (ERASE, dict(r0=0xFA)), (ERASE, dict(r0=0)),
             (ERASE, dict(r0=40, r4=CTX + 4)), (ERASE, dict(r0=40, length=511)), (ERASE, dict(r0=40, length=513)),
-            (PROGRAM, dict(r0=15)), (PROGRAM, dict(r0=133)), (PROGRAM, dict(r0=0xFF)),
+            (PROGRAM, dict(r0=15)), (PROGRAM, dict(r0=self.last_page + 1)), (PROGRAM, dict(r0=0xFF)),
             (PROGRAM, dict(r0=40, r1=PAYLOAD + 4)), (PROGRAM, dict(r0=40, r4=0x20000000)),
             (PROGRAM, dict(r0=40, length=1024)),
             (META_ERASE, dict(r0=0x80)), (META_PROGRAM, dict(r0=0x10000600)),
@@ -193,6 +194,17 @@ class AuthoredLoaderV107(AuthoredLoader):
     """Same checks on the v1.0.7 image; it differs only in the USB bootstrap re-entry."""
     loader = LOADER.with_name("ry72xx_loader_v107.bin")
     hold_return = 0x86B
+
+
+class AuthoredLoaderV107G65(AuthoredLoaderV107):
+    """v1.0.7 image for the G65: application pages 16..151 (CPU 0x2000..0x12FFF)."""
+    loader = LOADER.with_name("ry72xx_loader_v107_g65.bin")
+    last_page = 151
+
+    def test_nova_last_page_keeps_data_active(self):
+        u, status, _ = self.call(PROGRAM, 132, flash_fill=0xFF)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.stack_word(u, 8), 0xAAAAAAAA)
 
 
 class AuthoredHeader(unittest.TestCase):

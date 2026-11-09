@@ -7,7 +7,9 @@ import hashlib
 import struct
 
 START = 0x2000
-END = 0x10A00
+# Largest application end of any supported board (profiles.BOARDS); the board's
+# own end is enforced when an image is overlaid on that board's backup.
+APP_END_MAX = 0x13000
 FLASH_SIZE = 0x20000
 PAGE_SIZE = 512
 # Reserved Cortex-M0 vector entry 7 (0x1C): never fetched by the core, used for the
@@ -31,15 +33,16 @@ class Image:
     # New images get the bootloader checksum word; restored backups stay byte-exact.
     boot_checksum: bool = True
 
-    def overlay(self, before):
+    def overlay(self, before, end):
         require(len(before) == FLASH_SIZE, "Full 128 KiB pre-write backup required")
+        require(START < end <= APP_END_MAX and end % PAGE_SIZE == 0, "Unsupported application end")
         from .profiles import by_boot_sha
         by_boot_sha(digest(before[:START]))
         result = bytearray(before)
         for address, value in self.data.items():
-            require(START <= address < END, "Image outside supported application pages")
+            require(START <= address < end, "Image outside this board's application pages")
             result[address] = value
-        require(result[:START] == before[:START] and result[END:] == before[END:], "Protected region changed")
+        require(result[:START] == before[:START] and result[end:] == before[end:], "Protected region changed")
         return bytes(result)
 
 
@@ -47,7 +50,17 @@ def xor_words(data):
     return functools.reduce(int.__xor__, struct.unpack(f"<{len(data) // 4}I", data), 0)
 
 
-def with_boot_checksum(flash, metadata):
+def application_end(metadata):
+    """Exclusive application end from the info-flash metadata: start + length, rounded up to a page."""
+    require(len(metadata) == 512, "Full metadata block required")
+    words = struct.unpack("<128I", metadata)
+    require(xor_words(metadata[:0x1FC]) == words[0x7F], "Hidden metadata header checksum invalid")
+    flag, start, length = words[7], words[8], words[9]
+    require(flag == 1 and start == START and 0 < length and length % 4 == 0, "Unsupported application entry in hidden metadata")
+    return (start + length + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+
+
+def with_boot_checksum(flash, metadata, end):
     """Set the reserved vector word so the bootloader's application check passes.
 
     The info-flash metadata (0x10000600, the 512 bytes read by the session) holds
@@ -62,7 +75,7 @@ def with_boot_checksum(flash, metadata):
     words = struct.unpack("<128I", metadata)
     require(xor_words(metadata[:0x1FC]) == words[0x7F], "Hidden metadata header checksum invalid")
     flag, start, length, stored = words[7], words[8], words[9], words[10]
-    require(flag == 1 and start == START and length % 4 == 0 and CHECKSUM_WORD + 4 <= START + length <= END,
+    require(flag == 1 and start == START and length % 4 == 0 and CHECKSUM_WORD + 4 <= START + length <= end,
             "Unsupported application entry in hidden metadata")
     result = bytearray(flash)
     old = struct.unpack_from("<I", result, CHECKSUM_WORD)[0]
@@ -95,7 +108,7 @@ def parse_hex(text):
             require(size > 0 and address + size <= 0x10000, "Invalid data record span")
             for offset, value in enumerate(payload):
                 absolute = base + address + offset
-                require(START <= absolute < END, "Image touches bootloader, settings or unsupported pages")
+                require(START <= absolute < APP_END_MAX, "Image touches bootloader, settings or unsupported pages")
                 require(absolute not in data, "Overlapping Intel HEX records")
                 data[absolute] = value
         elif kind == 1:

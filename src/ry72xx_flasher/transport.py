@@ -6,12 +6,11 @@ import struct
 import sys
 import time
 
-from .image import require
-from .profiles import by_getv
+from .image import APP_END_MAX, PAGE_SIZE, START, require
+from .profiles import BOARDS, board_by_getv, by_getv
 from .stubs import core_stub, read_stub, hold_stub, release_stub
 
 BOOT = (0x352D, 0x1101)
-APP = (0x3532, 0xA0A3)
 QUERY = bytes.fromhex("0000000004000001") + b"getv"
 
 
@@ -22,7 +21,7 @@ def start_frame(header, image):
 
 
 def data_frame(sequence, page):
-    require(1 <= sequence <= 117 and len(page) == 512, "Invalid application DATA page")
+    require(1 <= sequence <= (APP_END_MAX - START) // PAGE_SIZE and len(page) == 512, "Invalid application DATA page")
     return bytes([2, sequence, 0, 0x73, 0, 2, 1, 0x77]) + page
 
 
@@ -52,7 +51,7 @@ def import_hidapi():
 
 
 class HIDTransport:
-    def __init__(self, header, enter_stock=False, wait_seconds=30, hid_module=None, resume_holder=False, profile=None):
+    def __init__(self, header, enter_stock=False, wait_seconds=30, hid_module=None, resume_holder=False, profile=None, board=None):
         if hid_module is None:
             hid_module = import_hidapi()
             shared_open(hid_module)
@@ -66,13 +65,14 @@ class HIDTransport:
         self.resume_holder = resume_holder
         # Bootloader revision: from GETV, or given for a held session (GETV would end it).
         self.profile = profile
-        require(not resume_holder or profile is not None, "A held session needs the backup's bootloader profile")
+        self.board = board
+        require(not resume_holder or (profile is not None and board is not None), "A held session needs the backup's bootloader profile and board")
 
     def open(self):
         deadline = time.monotonic() + self.wait_seconds
         entered = False
         while True:
-            boots, apps = self.hid.enumerate(*BOOT), self.hid.enumerate(*APP)
+            boots, apps = self.hid.enumerate(*BOOT), self.applications()
             require(len(boots) <= 1, "Multiple matching bootloaders; disconnect other boards")
             if boots:
                 require(not apps, "Other matching application interfaces remain connected")
@@ -97,8 +97,10 @@ class HIDTransport:
                 self.version = self.get_version()
                 return self.version
             if self.enter_stock and not entered:
-                vendors = [d for d in apps if d.get("usage_page") == 0xFF00 and d.get("serial_number") == "rankednova"]
-                require(len(apps) == 6 and len(vendors) == 1, "Automatic entry requires the original six-interface Nova application")
+                vendors = [d for d in apps if d.get("usage_page") == 0xFF00 and
+                           (d.get("vendor_id"), d.get("product_id"), d.get("serial_number")) in
+                           [(*board.app_usb, board.stock_serial) for board in BOARDS]]
+                require(len(apps) == 6 and len(vendors) == 1, "Automatic entry requires one original six-interface stock application")
                 app = self.hid.device()
                 try:
                     app.open_path(vendors[0]["path"])
@@ -127,9 +129,10 @@ class HIDTransport:
         reply = self._read(2000)
         require(reply[:16] == bytes.fromhex("0000000010000001") + b"version:", "Unrecognized bootloader version response")
         version = reply[16:24].hex()
-        profile = by_getv(version)
+        profile, board = by_getv(version), board_by_getv(version)
         require(self.profile in (None, profile), "Bootloader revision differs from the expected one")
-        self.profile = profile
+        require(self.board in (None, board), "Board differs from the expected one")
+        self.profile, self.board = profile, board
         return version
 
     def _reply(self, packet, sequence, length):
@@ -161,6 +164,7 @@ class HIDTransport:
         require(self.start(loader, 1) == b"\x04", "Bounded loader START rejected")
 
     def data(self, sequence, page):
+        require(self.board is not None and sequence <= (self.board.app_end - START) // PAGE_SIZE, "DATA page beyond this board's application")
         self._send(data_frame(sequence, page))
         require(self._reply(2, sequence, 1) == b"\x04", "Application DATA rejected")
 
@@ -189,10 +193,13 @@ class HIDTransport:
             self.handle.close()
             self.handle = None
 
+    def applications(self, board=None):
+        return [d for known in ([board] if board else BOARDS) for d in self.hid.enumerate(*known.app_usb)]
+
     def wait_application(self, timeout=10):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            apps, boots = self.hid.enumerate(*APP), self.hid.enumerate(*BOOT)
+            apps, boots = self.applications(self.board), self.hid.enumerate(*BOOT)
             if apps and not boots:
                 return dict(application_interfaces=len(apps), bootloader_interfaces=0)
             time.sleep(0.1)

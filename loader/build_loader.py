@@ -16,10 +16,11 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE / "ry72xx_loader.S"
 PACKAGE = HERE.parent / "src" / "ry72xx_flasher"
-# Packaged image -> assembler symbols (bootloader revision specific values, see profiles.py).
+# Packaged image -> assembler symbols (bootloader revision and board values, see profiles.py).
 VARIANTS = {
     PACKAGE / "ry72xx_loader.bin": {},
     PACKAGE / "ry72xx_loader_v107.bin": {"HOLD_RETURN": 0x86B},
+    PACKAGE / "ry72xx_loader_v107_g65.bin": {"HOLD_RETURN": 0x86B, "LAST_PAGE": 151},
 }
 
 
