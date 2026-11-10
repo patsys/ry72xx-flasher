@@ -25,7 +25,7 @@ range that matches it.
 | Board | Board ID | Stock application USB | Application pages | Stock settings pages | Status |
 |---|---|---|---|---|---|
 | Ranked Nova N60 | `a104` | `3532:a0a3` | `0x2000..0x109ff` (117) | `0xd5..0xdf` | see bootloader table |
-| Ranked G65 (Guardian 65%) | `a102` | `3532:a0c2` | `0x2000..0x12fff` (136) | `0xd0..0xec` | v1.0.7 only; read path validated on hardware (two matching full backups); flashing and release validated in emulation only |
+| Ranked G65 (Guardian 65%) | `a102` | `3532:a0c2` | `0x2000..0x12fff` (136) | `0xd0..0xec` | v1.0.7 only; read path, flashing and release validated on hardware (QMK images, full readback each time); restoring the stock application not yet tested |
 
 The G65 uses the same v1.0.7 bootloader bytes as the Nova N60; its stock
 application is longer (metadata length `0x10ebc`).
